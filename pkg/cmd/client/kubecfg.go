@@ -1,60 +1,77 @@
-/*
-Copyright 2014 Google Inc. All rights reserved.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package client
 
 import (
 	"fmt"
+	"io"
 	"io/ioutil"
+	"net/http"
 	"net/url"
 	"os"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
-	"text/template"
 	"time"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
-	kubeclient "github.com/GoogleCloudPlatform/kubernetes/pkg/client"
+	klatest "github.com/GoogleCloudPlatform/kubernetes/pkg/api/latest"
+	kmeta "github.com/GoogleCloudPlatform/kubernetes/pkg/api/meta"
+	kclient "github.com/GoogleCloudPlatform/kubernetes/pkg/client"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubecfg"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubectl"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/runtime"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/version"
 	"github.com/golang/glog"
+
+	"github.com/openshift/origin/pkg/api/latest"
+	buildapi "github.com/openshift/origin/pkg/build/api"
+	buildutil "github.com/openshift/origin/pkg/build/util"
+	osclient "github.com/openshift/origin/pkg/client"
+	. "github.com/openshift/origin/pkg/cmd/client/api"
+	"github.com/openshift/origin/pkg/cmd/client/build"
+	"github.com/openshift/origin/pkg/cmd/client/image"
+	"github.com/openshift/origin/pkg/cmd/client/project"
+	"github.com/openshift/origin/pkg/cmd/client/route"
+	"github.com/openshift/origin/pkg/config"
+	configapi "github.com/openshift/origin/pkg/config/api"
+	deployapi "github.com/openshift/origin/pkg/deploy/api"
+	deployclient "github.com/openshift/origin/pkg/deploy/client"
+	imageapi "github.com/openshift/origin/pkg/image/api"
+	projectapi "github.com/openshift/origin/pkg/project/api"
+	routeapi "github.com/openshift/origin/pkg/route/api"
 )
 
 type KubeConfig struct {
-	ServerVersion bool
-	PreventSkew   bool
-	HttpServer    string
-	Config        string
-	Selector      string
-	UpdatePeriod  time.Duration
-	PortSpec      string
-	ServicePort   int
-	AuthConfig    string
-	JSON          bool
-	YAML          bool
-	Verbose       bool
-	Proxy         bool
-	WWW           string
-	TemplateFile  string
-	TemplateStr   string
+	ClientConfig   kclient.Config
+	ServerVersion  bool
+	PreventSkew    bool
+	Config         string
+	TemplateConfig string
+	Selector       string
+	UpdatePeriod   time.Duration
+	PortSpec       string
+	ServicePort    int
+	AuthConfig     string
+	JSON           bool
+	YAML           bool
+	Verbose        bool
+	Proxy          bool
+	WWW            string
+	TemplateFile   string
+	TemplateStr    string
+	ID             string
+	Namespace      string
+	BuildConfigID  string
 
-	Args []string
+	ImageName string
+
+	APIVersion   string
+	OSAPIVersion string
+
+	Args   []string
+	ns     string
+	nsFile string
 }
 
 func (c *KubeConfig) Arg(index int) string {
@@ -70,100 +87,233 @@ func usage(name string) string {
   %[1]s [OPTIONS] get|list|create|delete|update <%[2]s>[/<id>]
 
   Manage replication controllers:
-  %[1]s [OPTIONS] stop|rm|rollingupdate <controller>
-  %[1]s [OPTIONS] run <image> <replicas> <controller>
+
+  %[1]s [OPTIONS] stop|rm <controller>
+  %[1]s [OPTIONS] [-u <time>] [-image <image>] rollingupdate <controller>
   %[1]s [OPTIONS] resize <controller> <replicas>
+
+  Launch a simple ReplicationController with a single container based
+  on the given image:
+
+  %[1]s [OPTIONS] [-p <port spec>] run <image> <replicas> <controller>
+
+  Manage namespace:
+  %[1]s [OPTIONS] ns [<namespace>]
+
+  Perform bulk operations on groups of Kubernetes resources:
+  %[1]s [OPTIONS] apply -c config.json
+
+  Process template into config:
+  %[1]s [OPTIONS] process -c template.json
+
+  Retrieve build logs:
+  %[1]s [OPTIONS] buildLogs --id="buildID"
 `, name, prettyWireStorage())
 }
 
+var parser = kubecfg.NewParser(map[string]runtime.Object{
+	"pods":                    &api.Pod{},
+	"services":                &api.Service{},
+	"replicationControllers":  &api.ReplicationController{},
+	"minions":                 &api.Node{},
+	"nodes":                   &api.Node{},
+	"builds":                  &buildapi.Build{},
+	"buildConfigs":            &buildapi.BuildConfig{},
+	"images":                  &imageapi.Image{},
+	"imageRepositories":       &imageapi.ImageRepository{},
+	"imageRepositoryMappings": &imageapi.ImageRepositoryMapping{},
+	"config":                  &configapi.Config{},
+	"deployments":             &deployapi.Deployment{},
+	"deploymentConfigs":       &deployapi.DeploymentConfig{},
+	"routes":                  &routeapi.Route{},
+	"projects":                &projectapi.Project{},
+})
+
 func prettyWireStorage() string {
-	types := kubecfg.SupportedWireStorage()
+	types := parser.SupportedWireStorage()
 	sort.Strings(types)
 	return strings.Join(types, "|")
 }
 
-// readConfig reads and parses pod, replicationController, and service
-// configuration files. If any errors log and exit non-zero.
-func (c *KubeConfig) readConfig(storage string) []byte {
-	if len(c.Config) == 0 {
-		glog.Fatal("Need config file (-c)")
+// readConfigData reads the bytes from the specified filesytem or network location associated with the *config flag
+func (c *KubeConfig) readConfigData() []byte {
+	// read from STDIN
+	if c.Config == "-" {
+		data, err := ioutil.ReadAll(os.Stdin)
+		if err != nil {
+			glog.Fatalf("Unable to read from STDIN: %v\n", err)
+		}
+		return data
 	}
+
+	// we look for http:// or https:// to determine if valid URL, otherwise do normal file IO
+	if url, err := url.Parse(c.Config); err == nil && (url.Scheme == "http" || url.Scheme == "https") {
+		resp, err := http.Get(url.String())
+		if err != nil {
+			glog.Fatalf("Unable to access URL %v: %v\n", c.Config, err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			glog.Fatalf("Unable to read URL, server reported %d %s", resp.StatusCode, resp.Status)
+		}
+		data, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			glog.Fatalf("Unable to read URL %v: %v\n", c.Config, err)
+		}
+		return data
+	}
+
 	data, err := ioutil.ReadFile(c.Config)
 	if err != nil {
 		glog.Fatalf("Unable to read %v: %v\n", c.Config, err)
 	}
-	data, err = kubecfg.ToWireFormat(data, storage)
+	return data
+}
+
+// readConfig reads and parses pod, replicationController, and service
+// configuration files. If any errors log and exit non-zero.
+func (c *KubeConfig) readConfig(storage string, serverCodec runtime.Codec) []byte {
+	if len(c.Config) == 0 {
+		glog.Fatal("Need config file (-c)")
+	}
+
+	data, err := parser.ToWireFormat(c.readConfigData(), storage, latest.Codec, serverCodec)
 	if err != nil {
-		glog.Fatalf("Error parsing %v as an object for %v: %v\n", c.Config, storage, err)
+		glog.Fatalf("Error parsing %v as an object for %v: %v", c.Config, storage, err)
 	}
 	if c.Verbose {
-		glog.Infof("Parsed config file successfully; sending:\n%v\n", string(data))
+		glog.Infof("Parsed config file successfully; sending:\n%v", string(data))
 	}
 	return data
+}
+
+// getNamespace returns the effective namespace for this invocation based on the first of:
+// 1.  The --ns argument
+// 2.  The contents of the nsFile
+// 3.  Uses the default namespace
+func (c *KubeConfig) getNamespace() string {
+	// Load namespace information for requests
+	nsInfo, err := kubecfg.LoadNamespaceInfo(c.nsFile)
+	if err != nil {
+		glog.Fatalf("Error loading current namespace: %v", err)
+	}
+	ret := nsInfo.Namespace
+
+	// Check if the namespace was overriden by the -ns argument
+	if len(c.ns) > 0 {
+		ret = c.ns
+	}
+
+	return ret
 }
 
 func (c *KubeConfig) Run() {
 	util.InitLogs()
 	defer util.FlushLogs()
 
-	secure := true
-	var masterServer string
-	if len(c.HttpServer) > 0 {
-		masterServer = c.HttpServer
-	} else if len(os.Getenv("KUBERNETES_MASTER")) > 0 {
-		masterServer = os.Getenv("KUBERNETES_MASTER")
-	} else {
-		masterServer = "http://localhost:8080"
+	clientConfig := &c.ClientConfig
+	// Initialize the client
+	if clientConfig.Host == "" {
+		clientConfig.Host = os.Getenv("KUBERNETES_MASTER")
 	}
-	parsedURL, err := url.Parse(masterServer)
-	if err != nil {
-		glog.Fatalf("Unable to parse %v as a URL\n", err)
+	if clientConfig.Host == "" {
+		// TODO: eventually apiserver should start on 443 and be secure by default
+		clientConfig.Host = "http://localhost:8080"
 	}
-	if parsedURL.Scheme != "" && parsedURL.Scheme != "https" {
-		secure = false
+	hosts := strings.SplitN(clientConfig.Host, ",", 2)
+	for i := range hosts {
+		hosts[i] = strings.TrimRight(hosts[i], "/")
 	}
+	clientConfig.Host = hosts[0]
 
-	var auth *kubeclient.AuthInfo
-	if secure {
-		auth, err = kubecfg.LoadAuthInfo(c.AuthConfig, os.Stdin)
+	if kclient.IsConfigTransportTLS(clientConfig) {
+		auth, err := kubecfg.LoadClientAuthInfoOrPrompt(c.AuthConfig, os.Stdin)
 		if err != nil {
 			glog.Fatalf("Error loading auth: %v", err)
 		}
+		clientConfig.Username = auth.User
+		clientConfig.Password = auth.Password
+		if auth.CAFile != "" {
+			clientConfig.CAFile = auth.CAFile
+		}
+		if auth.CertFile != "" {
+			clientConfig.CertFile = auth.CertFile
+		}
+		if auth.KeyFile != "" {
+			clientConfig.KeyFile = auth.KeyFile
+		}
+		if len(clientConfig.BearerToken) == 0 && auth.BearerToken != "" {
+			clientConfig.BearerToken = auth.BearerToken
+		}
+		if auth.Insecure != nil {
+			clientConfig.Insecure = *auth.Insecure
+		}
+	}
+	clientConfig.Version = c.APIVersion
+	kubeClient, err := kclient.New(clientConfig)
+	if err != nil {
+		glog.Fatalf("Unable to set up the Kubernetes API client: %v", err)
 	}
 
-	client := kubeclient.New(masterServer, auth)
+	if len(hosts) > 1 {
+		clientConfig.Host = hosts[1]
+	}
+	clientConfig.Version = c.OSAPIVersion
+	client, err := osclient.New(clientConfig)
+	if err != nil {
+		glog.Fatalf("Unable to set up the OpenShift API client: %v", err)
+	}
 
+	// check the kubernetes server version
 	if c.ServerVersion {
-		got, err := client.ServerVersion()
+		got, err := kubeClient.ServerVersion()
 		if err != nil {
-			fmt.Printf("Couldn't read version from server: %v\n", err)
+			fmt.Printf("Couldn't read version from server: %v", err)
 			os.Exit(1)
 		}
-		fmt.Printf("Server Version: %#v\n", got)
+		fmt.Printf("Server Version: %#v", got)
 		os.Exit(0)
 	}
 
 	if c.PreventSkew {
-		got, err := client.ServerVersion()
+		got, err := kubeClient.ServerVersion()
 		if err != nil {
-			fmt.Printf("Couldn't read version from server: %v\n", err)
+			fmt.Printf("Couldn't read version from server: %v", err)
 			os.Exit(1)
 		}
 		if c, s := version.Get(), *got; !reflect.DeepEqual(c, s) {
-			fmt.Printf("Server version (%#v) differs from client version (%#v)!\n", s, c)
+			fmt.Printf("Server version (%#v) differs from client version (%#v)!", s, c)
 			os.Exit(1)
 		}
 	}
 
 	if c.Proxy {
 		glog.Info("Starting to serve on localhost:8001")
-		server := kubecfg.NewProxyServer(c.WWW, masterServer, auth)
+		server, err := kubecfg.NewProxyServer(c.WWW, clientConfig)
+		if err != nil {
+			glog.Fatalf("Unable to initialize proxy server %v", err)
+		}
 		glog.Fatal(server.Serve())
 	}
 
 	method := c.Arg(0)
+	clients := ClientMappings{
+		"minions":                 {"Minion", kubeClient.RESTClient, klatest.Codec},
+		"pods":                    {"Pod", kubeClient.RESTClient, klatest.Codec},
+		"services":                {"Service", kubeClient.RESTClient, klatest.Codec},
+		"replicationControllers":  {"ReplicationController", kubeClient.RESTClient, klatest.Codec},
+		"builds":                  {"Build", client.RESTClient, latest.Codec},
+		"buildConfigs":            {"BuildConfig", client.RESTClient, latest.Codec},
+		"images":                  {"Image", client.RESTClient, latest.Codec},
+		"imageRepositories":       {"ImageRepository", client.RESTClient, latest.Codec},
+		"imageRepositoryMappings": {"ImageRepositoryMapping", client.RESTClient, latest.Codec},
+		"deployments":             {"Deployment", client.RESTClient, latest.Codec},
+		"deploymentConfigs":       {"DeploymentConfig", client.RESTClient, latest.Codec},
+		"routes":                  {"Route", client.RESTClient, latest.Codec},
+		"projects":                {"Project", client.RESTClient, latest.Codec},
+	}
 
-	matchFound := c.executeAPIRequest(method, client) || c.executeControllerRequest(method, client)
+	matchFound := c.executeConfigRequest(method, clients) || c.executeBuildRequest(method, client) || c.executeTemplateRequest(method, client) || c.executeBuildLogRequest(method, client) || c.executeControllerRequest(method, kubeClient) || c.executeNamespaceRequest(method) || c.executeAPIRequest(method, clients)
 	if matchFound == false {
 		glog.Fatalf("Unknown command %s", method)
 	}
@@ -182,7 +332,7 @@ func storagePathFromArg(arg string) (storage, path string, hasSuffix bool) {
 
 //checkStorage returns true if the provided storage is valid
 func checkStorage(storage string) bool {
-	for _, allowed := range kubecfg.SupportedWireStorage() {
+	for _, allowed := range parser.SupportedWireStorage() {
 		if allowed == storage {
 			return true
 		}
@@ -190,12 +340,17 @@ func checkStorage(storage string) bool {
 	return false
 }
 
-func (c *KubeConfig) executeAPIRequest(method string, client *kubeclient.Client) bool {
+func (c *KubeConfig) executeAPIRequest(method string, clients ClientMappings) bool {
 	storage, path, hasSuffix := storagePathFromArg(c.Arg(1))
 	validStorage := checkStorage(storage)
+	client, ok := clients[storage]
+	if !ok {
+		glog.Fatalf("Unsupported storage type %s", storage)
+	}
+
 	verb := ""
 	setBody := false
-	var version uint64
+	var version string
 	switch method {
 	case "get":
 		verb = "GET"
@@ -219,15 +374,15 @@ func (c *KubeConfig) executeAPIRequest(method string, client *kubeclient.Client)
 			glog.Fatalf("usage: kubecfg [OPTIONS] %s <%s>", method, prettyWireStorage())
 		}
 	case "update":
-		obj, err := client.Verb("GET").Path(path).Do().Get()
+		obj, err := client.Client.Verb("GET").Path(path).Do().Get()
 		if err != nil {
 			glog.Fatalf("error obtaining resource version for update: %v", err)
 		}
-		jsonBase, err := api.FindJSONBase(obj)
+		typeMeta, err := kmeta.Accessor(obj)
 		if err != nil {
 			glog.Fatalf("error finding json base for update: %v", err)
 		}
-		version = jsonBase.ResourceVersion()
+		version = typeMeta.ResourceVersion()
 		verb = "PUT"
 		setBody = true
 		if !validStorage || !hasSuffix {
@@ -237,34 +392,35 @@ func (c *KubeConfig) executeAPIRequest(method string, client *kubeclient.Client)
 		return false
 	}
 
-	r := client.Verb(verb).
+	r := client.Client.Verb(verb).
+		Namespace(c.getNamespace()).
 		Path(path).
 		ParseSelectorParam("labels", c.Selector)
 	if setBody {
-		if version != 0 {
-			data := c.readConfig(storage)
-			obj, err := api.Decode(data)
+		if len(version) != 0 {
+			data := c.readConfig(storage, client.Codec)
+			obj, err := latest.Codec.Decode(data)
 			if err != nil {
 				glog.Fatalf("error setting resource version: %v", err)
 			}
-			jsonBase, err := api.FindJSONBase(obj)
+			typeMeta, err := kmeta.Accessor(obj)
 			if err != nil {
 				glog.Fatalf("error setting resource version: %v", err)
 			}
-			jsonBase.SetResourceVersion(version)
-			data, err = api.Encode(obj)
+			typeMeta.SetResourceVersion(version)
+			data, err = client.Codec.Encode(obj)
 			if err != nil {
 				glog.Fatalf("error setting resource version: %v", err)
 			}
 			r.Body(data)
 		} else {
-			r.Body(c.readConfig(storage))
+			r.Body(c.readConfig(storage, client.Codec))
 		}
 	}
 	result := r.Do()
 	obj, err := result.Get()
 	if err != nil {
-		glog.Fatalf("Got request error: %v\n", err)
+		glog.Fatalf("Got request error: %v", err)
 		return false
 	}
 
@@ -280,22 +436,17 @@ func (c *KubeConfig) executeAPIRequest(method string, client *kubeclient.Client)
 			var err error
 			data, err = ioutil.ReadFile(c.TemplateFile)
 			if err != nil {
-				glog.Fatalf("Error reading template %s, %v\n", c.TemplateFile, err)
+				glog.Fatalf("Error reading template %s, %v", c.TemplateFile, err)
 				return false
 			}
 		} else {
 			data = []byte(c.TemplateStr)
 		}
-		tmpl, err := template.New("output").Parse(string(data))
-		if err != nil {
-			glog.Fatalf("Error parsing template %s, %v\n", string(data), err)
-			return false
-		}
-		printer = &kubecfg.TemplatePrinter{
-			Template: tmpl,
+		if printer, err = kubecfg.NewTemplatePrinter(data); err != nil {
+			glog.Fatalf("Failed to create printer %v", err)
 		}
 	default:
-		printer = &kubecfg.HumanReadablePrinter{}
+		printer = humanReadablePrinter()
 	}
 
 	if err = printer.PrintObj(obj, os.Stdout); err != nil {
@@ -307,22 +458,23 @@ func (c *KubeConfig) executeAPIRequest(method string, client *kubeclient.Client)
 	return true
 }
 
-func (c *KubeConfig) executeControllerRequest(method string, client *kubeclient.Client) bool {
+func (c *KubeConfig) executeControllerRequest(method string, client *kclient.Client) bool {
 	parseController := func() string {
 		if len(c.Args) != 2 {
-			glog.Fatal("usage: kubecfg [OPTIONS] stop|rm|rollingupdate <controller>")
+			glog.Fatal("usage: kubecfg [OPTIONS] stop|rm|rollingupdate|run|resize <controller>")
 		}
 		return c.Arg(1)
 	}
 
+	ctx := api.WithNamespace(api.NewContext(), c.getNamespace())
 	var err error
 	switch method {
 	case "stop":
-		err = kubecfg.StopController(parseController(), client)
+		err = kubecfg.StopController(ctx, parseController(), client)
 	case "rm":
-		err = kubecfg.DeleteController(parseController(), client)
+		err = kubecfg.DeleteController(ctx, parseController(), client)
 	case "rollingupdate":
-		err = kubecfg.Update(parseController(), client, c.UpdatePeriod)
+		err = kubecfg.Update(ctx, parseController(), client, c.UpdatePeriod, c.ImageName)
 	case "run":
 		if len(c.Args) != 4 {
 			glog.Fatal("usage: kubecfg [OPTIONS] run <image> <replicas> <controller>")
@@ -333,7 +485,7 @@ func (c *KubeConfig) executeControllerRequest(method string, client *kubeclient.
 		if err != nil {
 			glog.Fatalf("Error parsing replicas: %v", err)
 		}
-		err = kubecfg.RunController(image, name, replicas, client, c.PortSpec, c.ServicePort)
+		err = kubecfg.RunController(ctx, image, name, replicas, client, c.PortSpec, c.ServicePort)
 	case "resize":
 		args := c.Args
 		if len(args) < 3 {
@@ -344,12 +496,165 @@ func (c *KubeConfig) executeControllerRequest(method string, client *kubeclient.
 		if err != nil {
 			glog.Fatalf("Error parsing replicas: %v", err)
 		}
-		err = kubecfg.ResizeController(name, replicas, client)
+		err = kubecfg.ResizeController(ctx, name, replicas, client)
 	default:
 		return false
 	}
 	if err != nil {
 		glog.Fatalf("Error: %v", err)
 	}
+	return true
+}
+
+// executeBuildRequest will re-ran specified build or create a new one from specified buildConfig.
+// To re-run the build specify the buildID, from which the build parameters will be extracted.
+// E.g: openshift kube create builds --id="buildID"
+// To create a build from a buildConfig specify it's ID.
+// E.g: openshift kube create builds --from-build-cfg="buildConfigID"
+func (c *KubeConfig) executeBuildRequest(method string, client *osclient.Client) bool {
+	if method != "create" || c.Arg(1) != "builds" || (len(c.ID) == 0 && len(c.BuildConfigID) == 0) {
+		return false
+	}
+	build := &buildapi.Build{}
+	if len(c.ID) != 0 {
+		oldBuild := &buildapi.Build{}
+		request := client.Get().Namespace(c.getNamespace()).Path("/builds").Path(c.ID)
+		err := request.Do().Into(oldBuild)
+		if err != nil {
+			glog.Fatalf("failed to trigger build manually: %v", err)
+		}
+		build = buildutil.GenerateBuildFromBuild(oldBuild)
+	} else {
+		buildConfig := &buildapi.BuildConfig{}
+		request := client.Get().Namespace(c.getNamespace()).Path("/buildConfigs").Path(c.BuildConfigID)
+		err := request.Do().Into(buildConfig)
+		if err != nil {
+			glog.Fatalf("failed to trigger build manually: %v", err)
+		}
+		build = buildutil.GenerateBuildFromConfig(buildConfig, buildConfig.Parameters.Revision)
+	}
+	request := client.Post().Namespace(c.getNamespace()).Path("/builds").Body(build)
+	if err := request.Do().Error(); err != nil {
+		glog.Fatalf("failed to trigger build manually: %v", err)
+	}
+	return true
+}
+
+// executeBuildLogRequest retrieves the logs from builder container
+func (c *KubeConfig) executeBuildLogRequest(method string, client *osclient.Client) bool {
+	if method != "buildLogs" {
+		return false
+	}
+	if len(c.ID) == 0 {
+		glog.Fatal("Build ID required")
+	}
+	request := client.Verb("GET").Namespace(c.getNamespace()).Path("redirect").Path("buildLogs").Path(c.ID)
+	readCloser, err := request.Stream()
+	if err != nil {
+		glog.Fatalf("Error: %v", err)
+	}
+	defer readCloser.Close()
+	if _, err := io.Copy(os.Stdout, readCloser); err != nil {
+		glog.Fatalf("Error: %v", err)
+	}
+	return true
+}
+
+// executeTemplateRequest transform the JSON file with Config template into a
+// valid Config JSON.
+//
+// TODO: Print the output for each resource on success, as "create" method
+//       does in the executeAPIRequest().
+func (c *KubeConfig) executeTemplateRequest(method string, client *osclient.Client) bool {
+	if method != "process" {
+		return false
+	}
+	if len(c.Config) == 0 {
+		glog.Fatal("Need template file (-c)")
+	}
+	data, err := ioutil.ReadFile(c.Config)
+	if err != nil {
+		glog.Fatalf("error reading template file: %v", err)
+	}
+	request := client.Verb("POST").Namespace(c.getNamespace()).Path("/templateConfigs").Body(data)
+	result := request.Do()
+	body, err := result.Raw()
+	if err != nil {
+		glog.Fatalf("failed to process template: %v", err)
+	}
+	printer := JSONPrinter{}
+	if err := printer.Print(body, os.Stdout); err != nil {
+		glog.Fatalf("unable to pretty print config JSON: %v [%s]", err, string(body))
+	}
+	return true
+}
+
+func (c *KubeConfig) executeConfigRequest(method string, clients ClientMappings) bool {
+	if method != "apply" {
+		return false
+	}
+	if len(c.Config) == 0 {
+		glog.Fatal("Need to pass valid configuration file (-c config.json)")
+	}
+
+	clientFunc := func(m *kmeta.RESTMapping) (*kubectl.RESTHelper, error) {
+		mapping, ok := clients[m.Resource]
+		if !ok {
+			return nil, fmt.Errorf("Unable to provide REST client for %v", m.Resource)
+		}
+		return kubectl.NewRESTHelper(mapping.Client, m), nil
+	}
+
+	result, err := config.Apply(c.getNamespace(), c.readConfigData(), clientFunc)
+	if err != nil {
+		glog.Fatalf("Error applying the config: %v", err)
+	}
+	for _, itemResult := range result {
+		if len(itemResult.Errors) == 0 {
+			glog.Infof(itemResult.Message)
+			continue
+		}
+		for _, itemError := range itemResult.Errors {
+			glog.Errorf("%v", itemError)
+		}
+	}
+
+	return true
+}
+
+func humanReadablePrinter() *kubecfg.HumanReadablePrinter {
+	printer := kubecfg.NewHumanReadablePrinter()
+
+	// Add Handler calls here to support additional types
+	build.RegisterPrintHandlers(printer)
+	image.RegisterPrintHandlers(printer)
+	deployclient.RegisterPrintHandlers(printer)
+	route.RegisterPrintHandlers(printer)
+	project.RegisterPrintHandlers(printer)
+
+	return printer
+}
+
+func (c *KubeConfig) executeNamespaceRequest(method string) bool {
+	var err error
+	var ns *kubecfg.NamespaceInfo
+	switch method {
+	case "ns":
+		switch len(c.Args) {
+		case 1:
+			ns, err = kubecfg.LoadNamespaceInfo(c.nsFile)
+		case 2:
+			ns = &kubecfg.NamespaceInfo{Namespace: c.Args[1]}
+			err = kubecfg.SaveNamespaceInfo(c.nsFile, ns)
+		default:
+			glog.Fatalf("usage: kubecfg ns [<namespace>]")
+		}
+	default:
+		return false
+	}
+	if err != nil {
+		glog.Fatalf("Error: %v", err)
+	}
+	fmt.Printf("Using namespace %s\n", ns.Namespace)
 	return true
 }

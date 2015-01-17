@@ -7,18 +7,19 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const longDescription = `
-Kubernetes Command Line - kubecfg
-
-OpenShift currently embeds the kubecfg command line for prototyping and debugging.
-`
-
+// DEPRECATED, use NewCommandCLI instead
 func NewCommandKubecfg(name string) *cobra.Command {
 	cfg := &KubeConfig{}
 	cmd := &cobra.Command{
 		Use:   name,
-		Short: "The Kubernetes command line client",
-		Long:  longDescription + usage(name),
+		Short: "DEPRECATED, use 'cli' instead",
+		Long: `
+DEPRECATED, use 'cli' instead
+
+Kubernetes Command Line - kubecfg
+
+OpenShift currently embeds the kubecfg command line for prototyping and debugging.
+` + usage(name),
 		Run: func(c *cobra.Command, args []string) {
 			if len(args) < 1 {
 				c.Help()
@@ -31,8 +32,8 @@ func NewCommandKubecfg(name string) *cobra.Command {
 	flag := cmd.Flags()
 	flag.BoolVar(&cfg.ServerVersion, "server_version", false, "Print the server's version number.")
 	flag.BoolVar(&cfg.PreventSkew, "expect_version_match", false, "Fail if server's version doesn't match own version.")
-	flag.StringVarP(&cfg.HttpServer, "host", "h", "", "The host to connect to.")
-	flag.StringVarP(&cfg.Config, "config", "c", "", "Path to the config file.")
+	flag.StringVar(&cfg.ClientConfig.Host, "host", "", "The host to connect to.")
+	flag.StringVarP(&cfg.Config, "config", "c", "", "Path or URL to the config file, or '-' to read from STDIN")
 	flag.StringVarP(&cfg.Selector, "label", "l", "", "Selector (label query) to use for listing")
 	flag.DurationVarP(&cfg.UpdatePeriod, "update", "u", 60*time.Second, "Update interval period")
 	flag.StringVarP(&cfg.PortSpec, "port", "p", "", "The port spec, comma-separated list of <external>:<internal>,...")
@@ -45,5 +46,17 @@ func NewCommandKubecfg(name string) *cobra.Command {
 	flag.StringVar(&cfg.WWW, "www", "", "If -proxy is true, use this directory to serve static files")
 	flag.StringVar(&cfg.TemplateFile, "template_file", "", "If present, load this file as a golang template and use it for output printing")
 	flag.StringVar(&cfg.TemplateStr, "template", "", "If present, parse this string as a golang template and use it for output printing")
+	flag.StringVar(&cfg.ClientConfig.CAFile, "certificate_authority", "", "Path to a cert. file for the certificate authority")
+	flag.StringVar(&cfg.ClientConfig.CertFile, "client_certificate", "", "Path to a client certificate for TLS.")
+	flag.StringVar(&cfg.ClientConfig.KeyFile, "client_key", "", "Path to a client key file for TLS.")
+	flag.BoolVar(&cfg.ClientConfig.Insecure, "insecure_skip_tls_verify", false, "If true, the server's certificate will not be checked for validity. This will make your HTTPS connections insecure.")
+	flag.StringVar(&cfg.ImageName, "image", "", "Image used when updating a replicationController.  Will apply to the first container in the pod template.")
+	flag.StringVar(&cfg.ID, "id", "", "Specifies ID of requested resource.")
+	flag.StringVar(&cfg.ns, "ns", "", "If present, the namespace scope for this request.")
+	flag.StringVar(&cfg.nsFile, "ns_file", os.Getenv("HOME")+"/.kubernetes_ns", "Path to the namespace file")
+	flag.StringVar(&cfg.BuildConfigID, "from-build-cfg", "", "Specifies BuildConfigID from which the build should be created.")
+	// this is handy for end to end testing
+	flag.StringVar(&cfg.ClientConfig.BearerToken, "token", "", "If present, the bearer token for this request.")
+
 	return cmd
 }
